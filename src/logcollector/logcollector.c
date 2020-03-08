@@ -23,7 +23,6 @@ static void set_read(logreader *current, int i, int j);
 static IT_control remove_duplicates(logreader *current, int i, int j);
 static int find_duplicate_inode(logreader * lf);
 static void set_sockets();
-static void files_lock_init(void);
 static void check_text_only();
 static int check_pattern_expand(int do_seek);
 static void check_pattern_expand_excluded();
@@ -56,9 +55,6 @@ static pthread_mutex_t win_el_mutex;
 static pthread_mutexattr_t win_el_mutex_attr;
 #endif
 
-/* Multiple readers / one write mutex */
-static pthread_rwlock_t files_update_rwlock;
-
 static OSHash *excluded_files = NULL;
 static OSHash *excluded_binaries = NULL;
 
@@ -86,7 +82,6 @@ void LogCollectorStart()
     }
 
     set_sockets();
-    files_lock_init();
 
     // Check for expanded files
     check_pattern_expand(1);
@@ -303,7 +298,6 @@ void LogCollectorStart()
 
         /* Free hash table content for excluded files */
         if (f_free_excluded >= free_excluded_files_interval) {
-            w_rwlock_wrlock(&files_update_rwlock);
 
             mdebug1("Refreshing excluded files list.");
 
@@ -322,12 +316,9 @@ void LogCollectorStart()
             }
 
             f_free_excluded = 0;
-
-            w_rwlock_unlock(&files_update_rwlock);
         }
 
         if (f_check >= vcheck_files) {
-            w_rwlock_wrlock(&files_update_rwlock);
             int i;
             int j = -1;
             f_reload += f_check;
@@ -350,20 +341,18 @@ void LogCollectorStart()
                         }
                     }
 
+                    pthread_mutex_lock(&current->mutex);
+
                     if (current->file && current->fp) {
                         close_file(current);
                     }
+
+                    pthread_mutex_unlock(&current->mutex);
                 }
-
-                // Delay: yield mutex
-
-                w_rwlock_unlock(&files_update_rwlock);
 
                 if (reload_delay) {
                     nanosleep(&delay, NULL);
                 }
-
-                w_rwlock_wrlock(&files_update_rwlock);
 
                 // Open files again, and restore position
 
@@ -375,6 +364,8 @@ void LogCollectorStart()
                             break;
                         }
                     }
+
+                    pthread_mutex_lock(&current->mutex);
 
                     if (current->file && current->exists) {
                         if (reload_file(current) == -1) {
@@ -390,6 +381,7 @@ void LogCollectorStart()
                                 } else {
                                     mdebug1(CURRENT_FILES, current_files, maximum_files);
                                     i--;
+                                    pthread_mutex_unlock(&current->mutex);
                                     continue;
                                 }
                             } else if (open_file_attempts) {
@@ -399,6 +391,8 @@ void LogCollectorStart()
                             }
                         }
                     }
+
+                    pthread_mutex_unlock(&current->mutex);
                 }
             }
 
@@ -412,8 +406,11 @@ void LogCollectorStart()
                     }
                 }
 
+                pthread_mutex_lock(&current->mutex);
+
                 /* These are the windows logs or ignored files */
                 if (!current->file) {
+                    pthread_mutex_unlock(&current->mutex);
                     continue;
                 }
 
@@ -430,12 +427,14 @@ void LogCollectorStart()
                         current->exists = 1;
 
                         handle_file(i, j, 0, 1);
+                        pthread_mutex_unlock(&current->mutex);
                         continue;
                     }
 
                     /* Variable file name */
                     else if (!current->fp && open_file_attempts - current->ign > 0) {
                         handle_file(i, j, 1, 1);
+                        pthread_mutex_unlock(&current->mutex);
                         continue;
                     }
                 }
@@ -465,6 +464,7 @@ void LogCollectorStart()
                                 } else {
                                     mdebug1(CURRENT_FILES, current_files, maximum_files);
                                     i--;
+                                    pthread_mutex_unlock(&current->mutex);
                                     continue;
                                 }
                             } else if (open_file_attempts) {
@@ -520,6 +520,7 @@ void LogCollectorStart()
                             } else {
                                 mdebug2(CURRENT_FILES, current_files, maximum_files);
                                 i--;
+                                pthread_mutex_unlock(&current->mutex);
                                 continue;
                             }
                         } else if (open_file_attempts) {
@@ -559,6 +560,7 @@ void LogCollectorStart()
 
                         current->fp = NULL;
                         handle_file(i, j, 0, 1);
+                        pthread_mutex_unlock(&current->mutex);
                         continue;
                     }
 #ifdef WIN32
@@ -634,6 +636,7 @@ void LogCollectorStart()
                                 } else {
                                     mdebug2(CURRENT_FILES, current_files, maximum_files);
                                     i--;
+                                    pthread_mutex_unlock(&current->mutex);
                                     continue;
                                 }
                             }
@@ -654,6 +657,7 @@ void LogCollectorStart()
                 if (current->ign >= open_file_attempts) {
                     /* 999 Maximum ignore */
                     if (current->ign == 999) {
+                        pthread_mutex_unlock(&current->mutex);
                         continue;
                     }
 
@@ -672,19 +676,24 @@ void LogCollectorStart()
 
                     current->fp = NULL;
                     current->ign = 999;
+                    pthread_mutex_unlock(&current->mutex);
                     continue;
                 }
 
                 /* File not open */
                 if (!current->fp) {
                     if (current->ign >= 999) {
+                        pthread_mutex_unlock(&current->mutex);
                         continue;
                     } else {
                         /* Try for a few times to open the file */
                         handle_file(i, j, 1, 1);
+                        pthread_mutex_unlock(&current->mutex);
                         continue;
                     }
                 }
+
+                pthread_mutex_unlock(&current->mutex);
             }
 
             // Check for new files to be expanded
@@ -699,11 +708,16 @@ void LogCollectorStart()
                         }
                     }
 
+                    pthread_mutex_lock(&current->mutex);
+
                     duplicates_removed = remove_duplicates(current, i, j);
                     if (duplicates_removed == NEXT_IT) {
                         i--;
+                        pthread_mutex_unlock(&current->mutex);
                         continue;
                     }
+
+                    pthread_mutex_unlock(&current->mutex);
                 }
             }
 
@@ -712,9 +726,6 @@ void LogCollectorStart()
 
             /* Check for ASCII, UTF-8 */
             check_text_only();
-
-
-            w_rwlock_unlock(&files_update_rwlock);
 
             if (f_reload >= reload_interval) {
                 f_reload = 0;
@@ -1914,10 +1925,7 @@ void * w_input_thread(__attribute__((unused)) void * t_id){
         /* Check which file is available */
         for (i = 0, j = -1;; i++) {
 
-            w_rwlock_rdlock(&files_update_rwlock);
             if (f_control = update_current(&current, &i, &j), f_control) {
-                w_rwlock_unlock(&files_update_rwlock);
-
                 if (f_control == NEXT_IT) {
                     continue;
                 } else {
@@ -1937,7 +1945,6 @@ void * w_input_thread(__attribute__((unused)) void * t_id){
                         }
                     }
                     w_mutex_unlock(&current->mutex);
-                    w_rwlock_unlock(&files_update_rwlock);
                     continue;
                 }
 
@@ -1962,7 +1969,6 @@ void * w_input_thread(__attribute__((unused)) void * t_id){
                             fclose(current->fp);
                             current->fp = NULL;
                             w_mutex_unlock(&current->mutex);
-                            w_rwlock_unlock(&files_update_rwlock);
                             continue;
                         }
                     }
@@ -1974,7 +1980,6 @@ void * w_input_thread(__attribute__((unused)) void * t_id){
                 if ((r = fgetc(current->fp)) == EOF) {
                     clearerr(current->fp);
                     w_mutex_unlock(&current->mutex);
-                    w_rwlock_unlock(&files_update_rwlock);
                     continue;
                 }
 
@@ -1987,7 +1992,6 @@ void * w_input_thread(__attribute__((unused)) void * t_id){
                 if (current->h && (GetFileInformationByHandle(current->h, &lpFileInformation) == 0)) {
                     merror("Unable to get file information by handle.");
                     w_mutex_unlock(&current->mutex);
-                    w_rwlock_unlock(&files_update_rwlock);
                     continue;
                 } else {
                     FILETIME ft_handle = lpFileInformation.ftLastWriteTime;
@@ -2006,7 +2010,6 @@ void * w_input_thread(__attribute__((unused)) void * t_id){
                         current->fp = NULL;
                         current->h = NULL;
                         w_mutex_unlock(&current->mutex);
-                        w_rwlock_unlock(&files_update_rwlock);
                         continue;
                     }
                 }
@@ -2098,7 +2101,6 @@ void * w_input_thread(__attribute__((unused)) void * t_id){
                         /* Try to open it again */
                         if (handle_file(i, j, 0, 1)) {
                             w_mutex_unlock(&current->mutex);
-                            w_rwlock_unlock(&files_update_rwlock);
                             continue;
                         }
     #ifdef WIN32
@@ -2118,8 +2120,6 @@ void * w_input_thread(__attribute__((unused)) void * t_id){
                     w_mutex_unlock(&current->mutex);
                 }
             }
-
-            w_rwlock_unlock(&files_update_rwlock);
         }
     }
 
@@ -2148,22 +2148,6 @@ void w_create_input_threads(){
                      NULL);
 #endif
     }
-}
-
-void files_lock_init()
-{
-    pthread_rwlockattr_t attr;
-    pthread_rwlockattr_init(&attr);
-
-#ifdef __linux__
-    /* PTHREAD_RWLOCK_PREFER_WRITER_NP is ignored.
-     * Do not use recursive locking.
-     */
-    pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
-#endif
-
-    w_rwlock_init(&files_update_rwlock, &attr);
-    pthread_rwlockattr_destroy(&attr);
 }
 
 static void check_text_only() {
